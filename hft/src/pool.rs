@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub const NULL_IDX: u32 = u32::MAX;
 
 #[repr(C)]
@@ -59,7 +61,6 @@ impl OrderPool {
 
     #[inline(always)]
     pub unsafe fn get_mut_unchecked(&mut self, idx: u32) -> &mut Order {
-        // Wrapped in unsafe block to satisfy Rust 2024 Edition rules
         unsafe { self.pool.get_unchecked_mut(idx as usize) }
     }
 }
