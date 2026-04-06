@@ -10,10 +10,9 @@ pub fn parse_message(raw_bytes: &[u8]) -> OrderMessage {
     let order_type = raw_bytes[1]; 
     let ticker_id = u16::from_le_bytes(raw_bytes[2..4].try_into().unwrap());
     let user_id = u16::from_le_bytes(raw_bytes[4..6].try_into().unwrap()); 
-    
-    let price = u64::from_le_bytes(raw_bytes[6..14].try_into().unwrap());
-    let order_id = u64::from_le_bytes(raw_bytes[14..22].try_into().unwrap());
-    let quantity = u32::from_le_bytes(raw_bytes[22..26].try_into().unwrap());
+    let price = u32::from_le_bytes(raw_bytes[6..10].try_into().unwrap());
+    let order_id = u32::from_le_bytes(raw_bytes[10..14].try_into().unwrap());
+    let quantity = u32::from_le_bytes(raw_bytes[14..18].try_into().unwrap());
 
     OrderMessage {
         ticker_id,
@@ -23,21 +22,19 @@ pub fn parse_message(raw_bytes: &[u8]) -> OrderMessage {
         price,
         order_id,
         quantity,
-        display_quantity: quantity, // FIX: Default to fully visible for raw network packets
+        display_quantity: quantity,
         stop_signal: false,
     }
 }
 
 pub fn start_udp_listener(port: u16, queue: Arc<SpscQueue<OrderMessage>>, core_id: Option<core_affinity::CoreId>) {
     if let Some(id) = core_id {
-        if core_affinity::set_for_current(id) {
-            println!("Network Thread pinned strictly to Core {}", id.id);
-        }
+        core_affinity::set_for_current(id);
     }
 
     let address = format!("0.0.0.0:{}", port);
-    let socket = UdpSocket::bind(&address).expect("Failed to bind UDP socket");
-    socket.set_nonblocking(true).expect("Failed to set non-blocking");
+    let socket = UdpSocket::bind(&address).unwrap();
+    socket.set_nonblocking(true).unwrap();
 
     let mut buffer = [0u8; 1024]; 
     let mut batch = [OrderMessage::default(); 16];
@@ -46,8 +43,8 @@ pub fn start_udp_listener(port: u16, queue: Arc<SpscQueue<OrderMessage>>, core_i
     loop {
         match socket.recv_from(&mut buffer) {
             Ok((size, _src)) => {
-                if size == 26 {
-                    batch[batch_count] = parse_message(&buffer[..26]);
+                if size == 18 {
+                    batch[batch_count] = parse_message(&buffer[..18]);
                     batch_count += 1;
 
                     if batch_count == 16 {
@@ -71,10 +68,7 @@ pub fn start_udp_listener(port: u16, queue: Arc<SpscQueue<OrderMessage>>, core_i
                 }
                 std::hint::spin_loop();
             }
-            Err(e) => {
-                eprintln!("Socket error: {}", e);
-                break;
-            }
+            Err(_) => break,
         }
     }
 }

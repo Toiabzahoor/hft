@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use crate::pool::{OrderPool, NULL_IDX};
 
-pub type Price = u64;
+pub type Price = u32;
 pub type Quantity = u32;
 
 pub const TYPE_LIMIT: u8 = 0;
@@ -14,7 +14,7 @@ pub const TYPE_MODIFY: u8 = 4;
 pub struct MarketDataEvent {
     pub event_type: u8, 
     pub ticker_id: u16,
-    pub price: u64,
+    pub price: u32,
     pub quantity: u32,
 }
 
@@ -39,6 +39,8 @@ pub struct OrderBook {
     pub best_bid: Price,
     pub best_ask: Price,
     order_map: Vec<u32>, 
+    bid_bitmask: Vec<u64>,
+    ask_bitmask: Vec<u64>,
 }
 
 impl OrderBook {
@@ -49,15 +51,71 @@ impl OrderBook {
         for (i, level) in bids.iter_mut().enumerate() { level.price = i as Price; }
         for (i, level) in asks.iter_mut().enumerate() { level.price = i as Price; }
 
+        let mask_len = (max_price_ticks / 64) + 1;
+
         Self {
             bids, asks,
-            best_bid: 0, best_ask: max_price_ticks as u64 - 1,
+            best_bid: 0, best_ask: u32::MAX, // Track empty asks with MAX
             order_map: vec![NULL_IDX; max_orders],
+            bid_bitmask: vec![0; mask_len],
+            ask_bitmask: vec![0; mask_len],
         }
     }
 
     #[inline(always)]
-    pub fn cancel_order(&mut self, pool: &mut OrderPool, order_id: u64, user_id: u16, ticker_id: u16, egress_buf: &mut Vec<MarketDataEvent>) {
+    fn set_bit(&mut self, is_bid: bool, price: u32) {
+        let idx = (price / 64) as usize;
+        let bit = price % 64;
+        if is_bid { self.bid_bitmask[idx] |= 1u64 << bit; } 
+        else { self.ask_bitmask[idx] |= 1u64 << bit; }
+    }
+
+    #[inline(always)]
+    fn clear_bit(&mut self, is_bid: bool, price: u32) {
+        let idx = (price / 64) as usize;
+        let bit = price % 64;
+        if is_bid { self.bid_bitmask[idx] &= !(1u64 << bit); } 
+        else { self.ask_bitmask[idx] &= !(1u64 << bit); }
+    }
+
+    #[inline(always)]
+    fn find_next_ask(&self, current: u32) -> u32 {
+        if current == u32::MAX { return u32::MAX; }
+        let mut idx = (current / 64) as usize;
+        let bit = current % 64;
+        let mut mask = self.ask_bitmask[idx] & !((1u64 << bit) - 1);
+
+        while mask == 0 && idx < self.ask_bitmask.len() - 1 {
+            idx += 1;
+            mask = self.ask_bitmask[idx];
+        }
+        if mask == 0 { return u32::MAX; }
+        (idx as u32 * 64) + mask.trailing_zeros()
+    }
+
+    #[inline(always)]
+    fn find_next_bid(&self, current: u32) -> u32 {
+        if current == 0 { return 0; }
+        let mut idx = (current / 64) as usize;
+        let bit = current % 64;
+        
+        // Safe left shift to avoid panic at 64 on the CPU
+        let mut mask = if bit == 63 {
+            self.bid_bitmask[idx]
+        } else {
+            self.bid_bitmask[idx] & ((1u64 << (bit + 1)) - 1)
+        };
+
+        while mask == 0 && idx > 0 {
+            idx -= 1;
+            mask = self.bid_bitmask[idx];
+        }
+        if mask == 0 { return 0; }
+        (idx as u32 * 64) + (63 - mask.leading_zeros())
+    }
+
+    #[inline(always)]
+    pub fn cancel_order(&mut self, pool: &mut OrderPool, order_id: u32, user_id: u16, ticker_id: u16, egress_buf: &mut Vec<MarketDataEvent>) {
         if (order_id as usize) >= self.order_map.len() { return; }
         let idx = self.order_map[order_id as usize];
         if idx == NULL_IDX { return; } 
@@ -69,9 +127,18 @@ impl OrderBook {
 
         if owner_id != user_id { return; } 
 
-        let level = if is_bid { &mut self.bids[price as usize] } else { &mut self.asks[price as usize] };
-        
-        OrderBook::unlink_order(pool, level, prev_idx, next_idx, visible_qty);
+        let is_empty = {
+            let level = if is_bid { &mut self.bids[price as usize] } else { &mut self.asks[price as usize] };
+            OrderBook::unlink_order(pool, level, prev_idx, next_idx, visible_qty);
+            level.head_idx == NULL_IDX
+        };
+
+        if is_empty {
+            self.clear_bit(is_bid, price);
+            if is_bid && self.best_bid == price { self.best_bid = self.find_next_bid(price); }
+            else if !is_bid && self.best_ask == price { self.best_ask = self.find_next_ask(price); }
+        }
+
         pool.deallocate(idx);
         self.order_map[order_id as usize] = NULL_IDX;
 
@@ -80,7 +147,7 @@ impl OrderBook {
 
     #[inline(always)]
     pub fn modify_order(
-        &mut self, pool: &mut OrderPool, order_id: u64, is_bid_payload: bool, new_price: Price, new_quantity: u32, 
+        &mut self, pool: &mut OrderPool, order_id: u32, is_bid_payload: bool, new_price: Price, new_quantity: u32, 
         user_id: u16, ticker_id: u16, egress_buf: &mut Vec<MarketDataEvent>
     ) {
         if (order_id as usize) >= self.order_map.len() { return; }
@@ -113,43 +180,24 @@ impl OrderBook {
 
     #[inline(always)]
     pub fn process_order(
-        &mut self,
-        pool: &mut OrderPool,
-        is_bid: bool,
-        price: Price,
-        order_id: u64,
-        mut total_quantity: u32,
-        display_quantity: u32, 
-        order_type: u8,
-        ticker_id: u16,
-        user_id: u16,
-        egress_buf: &mut Vec<MarketDataEvent>,
+        &mut self, pool: &mut OrderPool, is_bid: bool, price: Price, order_id: u32, 
+        mut total_quantity: u32, display_quantity: u32, order_type: u8, 
+        ticker_id: u16, user_id: u16, egress_buf: &mut Vec<MarketDataEvent>,
     ) {
-        // FIX: Added anti-infinite loop failsafes (prev_qty checks)
         if is_bid {
-            while total_quantity > 0 && price >= self.best_ask {
-                let prev_qty = total_quantity;
+            while total_quantity > 0 && self.best_ask != u32::MAX && price >= self.best_ask {
                 total_quantity = self.execute_level(pool, false, self.best_ask, total_quantity, ticker_id, user_id, egress_buf);
-                
-                while self.asks[self.best_ask as usize].head_idx == NULL_IDX && self.best_ask < (self.asks.len() - 1) as u64 {
-                    self.best_ask += 1;
-                }
-                
-                if prev_qty == total_quantity && self.asks[self.best_ask as usize].head_idx == NULL_IDX {
-                    break;
+                if self.asks[self.best_ask as usize].head_idx == NULL_IDX {
+                    self.clear_bit(false, self.best_ask);
+                    self.best_ask = self.find_next_ask(self.best_ask);
                 }
             }
         } else {
-            while total_quantity > 0 && price <= self.best_bid && self.best_bid > 0 {
-                let prev_qty = total_quantity;
+            while total_quantity > 0 && self.best_bid > 0 && price <= self.best_bid {
                 total_quantity = self.execute_level(pool, true, self.best_bid, total_quantity, ticker_id, user_id, egress_buf);
-                
-                while self.bids[self.best_bid as usize].head_idx == NULL_IDX && self.best_bid > 0 {
-                    self.best_bid -= 1;
-                }
-
-                if prev_qty == total_quantity && self.bids[self.best_bid as usize].head_idx == NULL_IDX {
-                    break; 
+                if self.bids[self.best_bid as usize].head_idx == NULL_IDX {
+                    self.clear_bit(true, self.best_bid);
+                    self.best_bid = self.find_next_bid(self.best_bid);
                 }
             }
         }
@@ -163,10 +211,14 @@ impl OrderBook {
 
     #[inline(always)]
     pub fn add_order(
-        &mut self, pool: &mut OrderPool, is_bid: bool, price: Price, order_id: u64, 
+        &mut self, pool: &mut OrderPool, is_bid: bool, price: Price, order_id: u32, 
         visible_qty: u32, hidden_qty: u32, display_clip: u32, user_id: u16
     ) -> u32 {
+        let is_empty = if is_bid { self.bids[price as usize].head_idx == NULL_IDX } else { self.asks[price as usize].head_idx == NULL_IDX };
+        if is_empty { self.set_bit(is_bid, price); }
+
         let level = if is_bid { &mut self.bids[price as usize] } else { &mut self.asks[price as usize] };
+
         let new_idx = pool.allocate(order_id, price, is_bid, visible_qty, hidden_qty, display_clip, user_id);
 
         unsafe {
@@ -186,7 +238,7 @@ impl OrderBook {
         level.order_count += 1;
 
         if is_bid && price > self.best_bid { self.best_bid = price; } 
-        else if !is_bid && price < self.best_ask { self.best_ask = price; }
+        else if !is_bid && (self.best_ask == u32::MAX || price < self.best_ask) { self.best_ask = price; }
 
         self.order_map[order_id as usize] = new_idx;
         new_idx

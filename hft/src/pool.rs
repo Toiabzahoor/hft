@@ -3,18 +3,18 @@
 pub const NULL_IDX: u32 = u32::MAX;
 
 #[repr(C)]
-#[repr(align(64))] // Expanded to a full 64-byte CPU Cache Line
 #[derive(Debug, Clone, Copy)]
 pub struct Order {
-    pub order_id: u64,
-    pub price: u64,          // NEW: Required to locate the PriceLevel during an O(1) cancel
-    pub quantity: u32,       
-    pub hidden_quantity: u32,   
-    pub display_clip: u32,      
-    pub user_id: u16,
-    pub is_bid: bool,        // NEW: Required to know which side of the book to adjust
+    pub order_id: u32,
+    pub price: u32,
+    pub quantity: u32,
+    pub hidden_quantity: u32,
+    pub display_clip: u32,
     pub next_idx: u32,
     pub prev_idx: u32,
+    pub user_id: u16,
+    pub is_bid: bool,
+    pub _pad: u8,
 }
 
 pub struct OrderPool {
@@ -31,10 +31,11 @@ impl OrderPool {
                 quantity: 0,
                 hidden_quantity: 0,
                 display_clip: 0,
-                user_id: 0,
-                is_bid: false,
                 next_idx: NULL_IDX,
                 prev_idx: NULL_IDX,
+                user_id: 0,
+                is_bid: false,
+                _pad: 0,
             };
             capacity
         ];
@@ -47,9 +48,9 @@ impl OrderPool {
     }
 
     #[inline(always)]
-    pub fn allocate(&mut self, order_id: u64, price: u64, is_bid: bool, quantity: u32, hidden_quantity: u32, display_clip: u32, user_id: u16) -> u32 {
+    pub fn allocate(&mut self, order_id: u32, price: u32, is_bid: bool, quantity: u32, hidden_quantity: u32, display_clip: u32, user_id: u16) -> u32 {
         let idx = self.free_head;
-        if idx == NULL_IDX { panic!("Order pool exhausted!"); }
+        if idx == NULL_IDX { std::process::abort(); }
         
         self.free_head = self.pool[idx as usize].next_idx;
         

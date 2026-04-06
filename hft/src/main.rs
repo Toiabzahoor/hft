@@ -27,12 +27,47 @@ pub struct OrderMessage {
     pub user_id: u16, 
     pub is_bid: bool,
     pub order_type: u8, 
-    pub price: u64,
-    pub order_id: u64,
+    pub price: u32,
+    pub order_id: u32,
     pub quantity: u32,
     pub display_quantity: u32, 
     pub stop_signal: bool,
 }
+
+type DispatchFn = fn(&mut OrderBook, &mut OrderPool, &OrderMessage, &mut Vec<MarketDataEvent>);
+
+#[inline(always)]
+fn dispatch_limit(book: &mut OrderBook, pool: &mut OrderPool, msg: &OrderMessage, egress: &mut Vec<MarketDataEvent>) {
+    book.process_order(pool, msg.is_bid, msg.price, msg.order_id, msg.quantity, msg.display_quantity, msg.order_type, msg.ticker_id, msg.user_id, egress);
+}
+
+#[inline(always)]
+fn dispatch_ioc(book: &mut OrderBook, pool: &mut OrderPool, msg: &OrderMessage, egress: &mut Vec<MarketDataEvent>) {
+    book.process_order(pool, msg.is_bid, msg.price, msg.order_id, msg.quantity, msg.display_quantity, msg.order_type, msg.ticker_id, msg.user_id, egress);
+}
+
+#[inline(always)]
+fn dispatch_fok(book: &mut OrderBook, pool: &mut OrderPool, msg: &OrderMessage, egress: &mut Vec<MarketDataEvent>) {
+    book.process_order(pool, msg.is_bid, msg.price, msg.order_id, msg.quantity, msg.display_quantity, msg.order_type, msg.ticker_id, msg.user_id, egress);
+}
+
+#[inline(always)]
+fn dispatch_cancel(book: &mut OrderBook, pool: &mut OrderPool, msg: &OrderMessage, egress: &mut Vec<MarketDataEvent>) {
+    book.cancel_order(pool, msg.order_id, msg.user_id, msg.ticker_id, egress);
+}
+
+#[inline(always)]
+fn dispatch_modify(book: &mut OrderBook, pool: &mut OrderPool, msg: &OrderMessage, egress: &mut Vec<MarketDataEvent>) {
+    book.modify_order(pool, msg.order_id, msg.is_bid, msg.price, msg.quantity, msg.user_id, msg.ticker_id, egress);
+}
+
+static DISPATCH_TABLE: [DispatchFn; 5] = [
+    dispatch_limit,
+    dispatch_ioc,
+    dispatch_fok,
+    dispatch_cancel,
+    dispatch_modify,
+];
 
 pub struct Exchange {
     books: Vec<OrderBook>,
@@ -44,8 +79,6 @@ pub struct Exchange {
 
 impl Exchange {
     pub fn new(num_tickers: usize, pool_capacity_per_ticker: usize, egress_queue: Arc<SpscQueue<MarketDataEvent>>) -> Self {
-        println!("Allocating Exchange Memory for {} parallel tickers...", num_tickers);
-        
         let mut books = Vec::with_capacity(num_tickers);
         let mut pools = Vec::with_capacity(num_tickers);
         let mut strategies = Vec::with_capacity(num_tickers);
@@ -77,31 +110,21 @@ impl Exchange {
         }
     }
 
-    // --- NEW: Flattened Architecture (Zero Memset Overhead) ---
     #[inline(always)]
     pub fn route_and_execute(&mut self, msg: OrderMessage) {
         let idx = msg.ticker_id as usize;
         
-        // Step 1: Process the Retail Order & Evaluate the AI
         let (ai_actions, ai_count) = unsafe {
             let book = self.books.get_unchecked_mut(idx);
             let pool = self.pools.get_unchecked_mut(idx);
             let strategy = self.strategies.get_unchecked_mut(idx);
 
-            // Highly predictable branch logic
-            if msg.order_type <= TYPE_FOK {
-                book.process_order(pool, msg.is_bid, msg.price, msg.order_id, msg.quantity, msg.display_quantity, msg.order_type, msg.ticker_id, msg.user_id, &mut self.egress_buffer);
-            } else if msg.order_type == TYPE_MODIFY {
-                book.modify_order(pool, msg.order_id, msg.is_bid, msg.price, msg.quantity, msg.user_id, msg.ticker_id, &mut self.egress_buffer);
-            } else {
-                book.cancel_order(pool, msg.order_id, msg.user_id, msg.ticker_id, &mut self.egress_buffer);
-            }
+            let handler = DISPATCH_TABLE[msg.order_type as usize];
+            handler(book, pool, &msg, &mut self.egress_buffer);
 
             strategy.on_book_update(book, msg.ticker_id)
         };
 
-        // Step 2: Process the AI Responses Instantly
-        // We do NOT feed these back into the strategy to prevent recursive unrolling.
         if ai_count > 0 {
             unsafe {
                 let book = self.books.get_unchecked_mut(idx);
@@ -109,14 +132,8 @@ impl Exchange {
 
                 for i in 0..ai_count {
                     let ai_msg = &ai_actions[i];
-                    
-                    if ai_msg.order_type <= TYPE_FOK {
-                        book.process_order(pool, ai_msg.is_bid, ai_msg.price, ai_msg.order_id, ai_msg.quantity, ai_msg.display_quantity, ai_msg.order_type, ai_msg.ticker_id, ai_msg.user_id, &mut self.egress_buffer);
-                    } else if ai_msg.order_type == TYPE_MODIFY {
-                        book.modify_order(pool, ai_msg.order_id, ai_msg.is_bid, ai_msg.price, ai_msg.quantity, ai_msg.user_id, ai_msg.ticker_id, &mut self.egress_buffer);
-                    } else {
-                        book.cancel_order(pool, ai_msg.order_id, ai_msg.user_id, ai_msg.ticker_id, &mut self.egress_buffer);
-                    }
+                    let handler = DISPATCH_TABLE[ai_msg.order_type as usize];
+                    handler(book, pool, ai_msg, &mut self.egress_buffer);
                 }
             }
         }
@@ -124,30 +141,17 @@ impl Exchange {
 }
 
 fn run_replay(journal_path: &str) {
-    println!("Initiating Crash Recovery: Replaying Journal from disk...");
-    
-    let file = std::fs::File::open(journal_path).expect("Failed to open journal.");
-    let mmap = unsafe { memmap2::MmapOptions::new().map(&file).expect("Failed to map memory") };
+    let file = std::fs::File::open(journal_path).expect("");
+    let mmap = unsafe { memmap2::MmapOptions::new().map(&file).expect("") };
 
     let msg_size = std::mem::size_of::<OrderMessage>();
     let num_messages = mmap.len() / msg_size;
-    println!("Located {} exact frozen orders in the journal.", num_messages);
 
-    let start = Instant::now();
     let ptr = mmap.as_ptr() as *const OrderMessage;
-    
-    let mut cancel_count = 0;
-    let mut modify_count = 0;
 
     for i in 0..num_messages {
-        let msg = unsafe { *ptr.add(i) }; 
-        if msg.order_type == TYPE_CANCEL { cancel_count += 1; }
-        if msg.order_type == TYPE_MODIFY { modify_count += 1; }
+        let _msg = unsafe { *ptr.add(i) }; 
     }
-
-    println!("--- RECOVERY SCAN COMPLETE ---");
-    println!("Scanned {} million orders in {:?}", num_messages / 1_000_000, start.elapsed());
-    println!("Discovered {} Cancels and {} Modifications.", cancel_count, modify_count);
 }
 
 fn main() {
@@ -156,8 +160,6 @@ fn main() {
         run_replay("market_events.journal");
         return;
     }
-
-    println!("Initializing Complete Architecture: Ingress -> Engine -> Egress...");
 
     let ingress_queue = Arc::new(SpscQueue::<OrderMessage>::new(131_072));
     let egress_queue = Arc::new(SpscQueue::<MarketDataEvent>::new(131_072));
@@ -220,9 +222,10 @@ fn main() {
                         let elapsed = start_time.elapsed();
                         let nanos_per_msg = elapsed.as_nanos() as f64 / total_messages as f64;
                         
-                        println!("--- PIPELINE BENCHMARK COMPLETE ---");
+                       
                         println!("Processed {} packets across {} tickers in {:?}", total_messages, num_tickers, elapsed);
                         println!("End-to-End Latency: {:.2} nanoseconds per message", nanos_per_msg);
+                        println!("Ticker 42 Best Bid: {}, Best Ask: {}", exchange.books[42].best_bid, exchange.books[42].best_ask);
                         std::process::exit(0); 
                     }
                 }
@@ -246,10 +249,10 @@ fn main() {
 
         for i in 0..total_messages {
             let is_bid = i % 2 == 0;
-            let price = 50_000 + (i % 10) as u64; 
+            let price = 50_000 + (i % 10) as u32; 
             let ticker_id = ((i / burst_size) % num_tickers) as u16;
             let user_id = (i % 1000) as u16; 
-            let local_order_id = (i / num_tickers) as u64; 
+            let local_order_id = (i / num_tickers) as u32; 
             
             let mut order_type = TYPE_LIMIT;
             let mut quantity = 10;
@@ -290,7 +293,6 @@ fn main() {
         }
 
         journal.flush();
-        println!("✅ SUCCESS: All trades safely journaled and flushed to disk.");
     });
 
     producer_handle.join().unwrap();

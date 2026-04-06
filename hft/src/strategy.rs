@@ -4,11 +4,11 @@ use crate::{OrderMessage, TYPE_LIMIT, TYPE_MODIFY};
 
 pub struct MarketMakerStrategy {
     pub user_id: u16,
-    pub active_bid_id: u64,
-    pub active_ask_id: u64,
+    pub active_bid_id: u32,
+    pub active_ask_id: u32,
     pub current_bid_price: Price,
     pub current_ask_price: Price,
-    pub base_order_id: u64,
+    pub base_order_id: u32,
     pub spread_tolerance: Price,
 }
 
@@ -20,8 +20,6 @@ impl MarketMakerStrategy {
             active_ask_id: 0,
             current_bid_price: 0,
             current_ask_price: 0,
-            // FIX: Start AI order IDs at 20,000. 
-            // Retail maxes out around 19,531. Array maxes out at 50,000. This fits perfectly.
             base_order_id: 20_000, 
             spread_tolerance,
         }
@@ -35,7 +33,7 @@ impl MarketMakerStrategy {
         let best_bid = book.best_bid;
         let best_ask = book.best_ask;
 
-        if best_bid == 0 || best_ask >= book.asks.len() as u64 || best_bid >= best_ask {
+        if best_bid == 0 || best_ask == u32::MAX || best_bid >= best_ask {
             return (actions, count);
         }
 
