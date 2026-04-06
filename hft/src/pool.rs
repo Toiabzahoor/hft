@@ -3,11 +3,16 @@
 pub const NULL_IDX: u32 = u32::MAX;
 
 #[repr(C)]
-#[repr(align(32))]
+#[repr(align(64))] // Expanded to a full 64-byte CPU Cache Line
 #[derive(Debug, Clone, Copy)]
 pub struct Order {
     pub order_id: u64,
-    pub quantity: u32,
+    pub price: u64,          // NEW: Required to locate the PriceLevel during an O(1) cancel
+    pub quantity: u32,       
+    pub hidden_quantity: u32,   
+    pub display_clip: u32,      
+    pub user_id: u16,
+    pub is_bid: bool,        // NEW: Required to know which side of the book to adjust
     pub next_idx: u32,
     pub prev_idx: u32,
 }
@@ -22,7 +27,12 @@ impl OrderPool {
         let mut pool = vec![
             Order {
                 order_id: 0,
+                price: 0,
                 quantity: 0,
+                hidden_quantity: 0,
+                display_clip: 0,
+                user_id: 0,
+                is_bid: false,
                 next_idx: NULL_IDX,
                 prev_idx: NULL_IDX,
             };
@@ -37,7 +47,7 @@ impl OrderPool {
     }
 
     #[inline(always)]
-    pub fn allocate(&mut self, order_id: u64, quantity: u32) -> u32 {
+    pub fn allocate(&mut self, order_id: u64, price: u64, is_bid: bool, quantity: u32, hidden_quantity: u32, display_clip: u32, user_id: u16) -> u32 {
         let idx = self.free_head;
         if idx == NULL_IDX { panic!("Order pool exhausted!"); }
         
@@ -45,7 +55,12 @@ impl OrderPool {
         
         let order = &mut self.pool[idx as usize];
         order.order_id = order_id;
+        order.price = price;
+        order.is_bid = is_bid;
         order.quantity = quantity;
+        order.hidden_quantity = hidden_quantity;
+        order.display_clip = display_clip;
+        order.user_id = user_id;
         order.next_idx = NULL_IDX;
         order.prev_idx = NULL_IDX;
         

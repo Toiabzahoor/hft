@@ -6,3 +6,4 @@ edition = "2024"
 
 [dependencies]
 core_affinity = "0.8.1"
+memmap2 = "0.9.3"

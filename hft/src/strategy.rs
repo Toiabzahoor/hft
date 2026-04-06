@@ -1,46 +1,84 @@
 #![allow(dead_code)]
-use crate::orderbook::OrderBook;
+use crate::orderbook::{OrderBook, Price};
+use crate::{OrderMessage, TYPE_LIMIT, TYPE_MODIFY};
 
 pub struct MarketMakerStrategy {
-    pub current_position: i32, 
-    pub max_position: i32,     
-    pub base_spread: u64,      
-}
-
-#[derive(Debug)]
-pub struct TargetQuote {
-    pub bid: u64,
-    pub ask: u64,
+    pub user_id: u16,
+    pub active_bid_id: u64,
+    pub active_ask_id: u64,
+    pub current_bid_price: Price,
+    pub current_ask_price: Price,
+    pub base_order_id: u64,
+    pub spread_tolerance: Price,
 }
 
 impl MarketMakerStrategy {
-    pub fn new(max_position: i32, base_spread: u64) -> Self {
-        Self { current_position: 0, max_position, base_spread }
+    pub fn new(user_id: u16, spread_tolerance: Price) -> Self {
+        Self {
+            user_id,
+            active_bid_id: 0,
+            active_ask_id: 0,
+            current_bid_price: 0,
+            current_ask_price: 0,
+            // FIX: Start AI order IDs at 20,000. 
+            // Retail maxes out around 19,531. Array maxes out at 50,000. This fits perfectly.
+            base_order_id: 20_000, 
+            spread_tolerance,
+        }
     }
 
     #[inline(always)]
-    pub fn on_book_update(&mut self, book: &OrderBook) -> Option<TargetQuote> {
+    pub fn on_book_update(&mut self, book: &OrderBook, ticker_id: u16) -> ([OrderMessage; 2], usize) {
+        let mut actions = [OrderMessage::default(); 2];
+        let mut count = 0;
+
         let best_bid = book.best_bid;
         let best_ask = book.best_ask;
 
-        if best_bid == 0 || best_bid >= best_ask {
-            return None; 
+        if best_bid == 0 || best_ask >= book.asks.len() as u64 || best_bid >= best_ask {
+            return (actions, count);
         }
 
-        let mid_price = (best_bid as f64 + best_ask as f64) / 2.0;
+        let mid_price = (best_bid + best_ask) / 2;
+        let target_bid = mid_price.saturating_sub(self.spread_tolerance);
+        let target_ask = mid_price + self.spread_tolerance;
 
-        let bid_vol = book.bids[best_bid as usize].volume as f64;
-        let ask_vol = book.asks[best_ask as usize].volume as f64;
-        let total_vol = bid_vol + ask_vol;
-        
-        let obi = if total_vol > 0.0 { (bid_vol - ask_vol) / total_vol } else { 0.0 };
-        let inventory_skew = self.current_position as f64 / self.max_position as f64;
-        let skew_ticks = (obi * 2.0) - (inventory_skew * 2.0);
-        let target_mid = (mid_price + skew_ticks).round() as u64;
+        if self.current_bid_price != target_bid {
+            if self.active_bid_id != 0 {
+                actions[count] = OrderMessage {
+                    ticker_id, user_id: self.user_id, is_bid: true, order_type: TYPE_MODIFY,
+                    price: target_bid, order_id: self.active_bid_id, quantity: 100, display_quantity: 100, stop_signal: false,
+                };
+            } else {
+                self.base_order_id += 1;
+                self.active_bid_id = self.base_order_id;
+                actions[count] = OrderMessage {
+                    ticker_id, user_id: self.user_id, is_bid: true, order_type: TYPE_LIMIT,
+                    price: target_bid, order_id: self.active_bid_id, quantity: 100, display_quantity: 100, stop_signal: false,
+                };
+            }
+            self.current_bid_price = target_bid;
+            count += 1;
+        }
 
-        Some(TargetQuote {
-            bid: target_mid.saturating_sub(self.base_spread / 2),
-            ask: target_mid + (self.base_spread / 2),
-        })
+        if self.current_ask_price != target_ask {
+            if self.active_ask_id != 0 {
+                actions[count] = OrderMessage {
+                    ticker_id, user_id: self.user_id, is_bid: false, order_type: TYPE_MODIFY,
+                    price: target_ask, order_id: self.active_ask_id, quantity: 100, display_quantity: 100, stop_signal: false,
+                };
+            } else {
+                self.base_order_id += 1;
+                self.active_ask_id = self.base_order_id;
+                actions[count] = OrderMessage {
+                    ticker_id, user_id: self.user_id, is_bid: false, order_type: TYPE_LIMIT,
+                    price: target_ask, order_id: self.active_ask_id, quantity: 100, display_quantity: 100, stop_signal: false,
+                };
+            }
+            self.current_ask_price = target_ask;
+            count += 1;
+        }
+
+        (actions, count)
     }
 }

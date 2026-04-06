@@ -7,20 +7,23 @@ use std::io;
 #[inline(always)]
 pub fn parse_message(raw_bytes: &[u8]) -> OrderMessage {
     let msg_type = raw_bytes[0];
-    let order_type = raw_bytes[1]; // NEW: Parse the type byte
+    let order_type = raw_bytes[1]; 
     let ticker_id = u16::from_le_bytes(raw_bytes[2..4].try_into().unwrap());
+    let user_id = u16::from_le_bytes(raw_bytes[4..6].try_into().unwrap()); 
     
-    let price = u64::from_le_bytes(raw_bytes[4..12].try_into().unwrap());
-    let order_id = u64::from_le_bytes(raw_bytes[12..20].try_into().unwrap());
-    let quantity = u32::from_le_bytes(raw_bytes[20..24].try_into().unwrap());
+    let price = u64::from_le_bytes(raw_bytes[6..14].try_into().unwrap());
+    let order_id = u64::from_le_bytes(raw_bytes[14..22].try_into().unwrap());
+    let quantity = u32::from_le_bytes(raw_bytes[22..26].try_into().unwrap());
 
     OrderMessage {
         ticker_id,
+        user_id,
         is_bid: msg_type == b'B',
         order_type,
         price,
         order_id,
         quantity,
+        display_quantity: quantity, // FIX: Default to fully visible for raw network packets
         stop_signal: false,
     }
 }
@@ -43,9 +46,8 @@ pub fn start_udp_listener(port: u16, queue: Arc<SpscQueue<OrderMessage>>, core_i
     loop {
         match socket.recv_from(&mut buffer) {
             Ok((size, _src)) => {
-                // Packet is now exactly 24 bytes
-                if size == 24 {
-                    batch[batch_count] = parse_message(&buffer[..24]);
+                if size == 26 {
+                    batch[batch_count] = parse_message(&buffer[..26]);
                     batch_count += 1;
 
                     if batch_count == 16 {
